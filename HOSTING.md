@@ -6,6 +6,77 @@ multilingual diffusion TTS (Qwen3-0.6B backbone, HiggsAudio V2 tokenizer,
 DAC acoustic decoder, 24 kHz output) — as a block-wise streaming service
 behind an OpenAI-compatible `/v1/audio/speech` endpoint.
 
+## Streaming endpoint
+
+**Primary surface**: `POST /v1/audio/speech` with `"stream": true`.
+
+Audio is emitted incrementally as each temporal block finishes on the GPU.
+First-chunk latency is ~100 ms on H100 (see perf table below); the server
+keeps streaming subsequent blocks until the utterance is complete. The
+response is a standard `chunked` HTTP body (no websockets, no custom
+protocol) so any OpenAI-compatible client works.
+
+### Minimal streaming client (Python)
+
+```python
+import httpx, time
+
+payload = {
+    "model": "k2-fsa/OmniVoice",
+    "input": "Hello, how are you?",
+    "voice": "default",
+    "response_format": "wav",           # or "pcm" for lowest latency
+    "stream": True,
+}
+
+t0 = time.perf_counter()
+with httpx.Client(timeout=300.0) as c:
+    with c.stream("POST", "https://<endpoint>/v1/audio/speech", json=payload) as r:
+        r.raise_for_status()
+        first = None
+        with open("out.wav", "wb") as f:
+            for chunk in r.iter_bytes():
+                if not chunk:
+                    continue
+                if first is None:
+                    first = time.perf_counter() - t0
+                    print(f"first chunk at {first*1000:.0f} ms")
+                f.write(chunk)
+print(f"total {time.perf_counter()-t0:.2f} s")
+```
+
+### Minimal streaming client (curl)
+
+```bash
+curl -N -X POST https://<endpoint>/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "k2-fsa/OmniVoice",
+    "input": "Hello, how are you?",
+    "voice": "default",
+    "response_format": "wav",
+    "stream": true
+  }' --output out.wav
+```
+
+`-N` disables curl's buffering so the WAV bytes hit disk as they arrive.
+
+### Voice cloning
+
+Same endpoint, add two fields:
+
+```json
+{
+  "input": "...",
+  "stream": true,
+  "ref_audio": "data:audio/wav;base64,<...>",
+  "ref_text": "<transcript of the reference audio>"
+}
+```
+
+`ref_audio` accepts `data:` base64 URIs, `http(s)` URLs, or `file://` paths.
+`ref_text` is required for best fidelity.
+
 ## What this repo provides
 
 - **`start_omnivoice_server.sh`** — one-command launcher with the tuned
@@ -126,16 +197,6 @@ If you are wrapping this in Modal, Baseten, Kubernetes, or anywhere else:
    weights across container restarts (~600 MB).
 9. **HF token**: only required if you swap in a gated model. `k2-fsa/OmniVoice`
    itself is public.
-
-## API surface
-
-Standard OpenAI `/v1/audio/speech` plus two extra fields for voice cloning:
-
-- `ref_audio`: URL (`http://`, `https://`, `file://`) or `data:audio/wav;base64,...`.
-- `ref_text`: transcript of the reference audio (needed for best fidelity).
-- `stream: true`: enables block-wise WAV/PCM streaming.
-
-See `examples/online_serving/omnivoice/README.md` for full client examples.
 
 ## Contact
 
